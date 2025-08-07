@@ -1,0 +1,443 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "Set Environment",
+  "States": {
+    "Set Environment": {
+      "Type": "Pass",
+      "Assign": {
+        "APP_ENV": "${app_env}"
+      },
+      "Next": "Initialize Task",
+      "Output": {}
+    },
+    "Initialize Task": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${init_task_lambda_function_arn}",
+        "Payload": {
+          "APP_ENV": "{% $APP_ENV %}"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "Extract Data",
+      "Output": {},
+      "Assign": {
+        "AWS_REGION": "{% $states.result.Payload.aws_region %}",
+        "TASK_DATE": "{% $states.result.Payload.task_date %}",
+        "INTEGRATION_BUCKET": "{% $states.result.Payload.integration_bucket %}",
+        "ADDRESS_DESTINATION": "{% $states.result.Payload.address_destination %}",
+        "AIR_QUALITY_CURRENT_DESTINATION": "{% $states.result.Payload.air_quality_current_destination %}",
+        "AIR_QUALITY_FORECAST_DESTINATION": "{% $states.result.Payload.air_quality_forecast_destination %}",
+        "TASK_BATCH_DESTINATION": "{% $states.result.Payload.task_batch_destination %}",
+        "BATCH_SIZE": "{% $states.result.Payload.batch_size %}",
+        "CONCURRENCY": "{% $states.result.Payload.concurrency %}"
+      }
+    },
+    "Extract Data": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Arguments": {
+        "LaunchType": "FARGATE",
+        "Cluster": "${ecs_cluster_arn}",
+        "TaskDefinition": "${ecs_extract_data_task_definition_arn}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${private_subnet_ids}"],
+            "SecurityGroups": ["${step_function_state_machine_sg_id}"],
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "task-runner",
+              "Environment": [
+                { "Name": "APP_ENV", "Value": "{% $APP_ENV %}" },
+                { "Name": "AWS_REGION", "Value": "{% $AWS_REGION %}" },
+                {
+                  "Name": "INTEGRATION_BUCKET",
+                  "Value": "{% $INTEGRATION_BUCKET %}"
+                },
+                {
+                  "Name": "ADDRESS_DESTINATION",
+                  "Value": "{% $ADDRESS_DESTINATION %}"
+                },
+                { "Name": "TASK_DATE", "Value": "{% $TASK_DATE %}" },
+                { "Name": "STEP_FUNCTION_RUNNER", "Value": "true" }
+              ]
+            }
+          ]
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "Create Task Batches",
+      "Output": {}
+    },
+    "Create Task Batches": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${create_batch_job_task_lambda_function_arn}",
+        "Payload": {
+          "APP_ENV": "{% $APP_ENV %}",
+          "AWS_REGION": "{% $AWS_REGION %}",
+          "INTEGRATION_BUCKET": "{% $INTEGRATION_BUCKET %}",
+          "ADDRESS_DESTINATION": "{% $ADDRESS_DESTINATION %}",
+          "AIR_QUALITY_CURRENT_DESTINATION": "{% $AIR_QUALITY_CURRENT_DESTINATION %}",
+          "AIR_QUALITY_FORECAST_DESTINATION": "{% $AIR_QUALITY_FORECAST_DESTINATION %}",
+          "TASK_BATCH_DESTINATION": "{% $TASK_BATCH_DESTINATION %}",
+          "TASK_DATE": "{% $TASK_DATE %}",
+          "BATCH_SIZE": "{% $BATCH_SIZE %}",
+          "CONCURRENCY": "{% $CONCURRENCY %}"
+        }
+      },
+      "Next": "Run Current & Forecast Batches in Parallel",
+      "Assign": {
+        "BATCH_S3_KEY": "{% $states.result.Payload %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["NoRecordFound"],
+          "Next": "Handle No Files Available"
+        }
+      ],
+      "Output": {}
+    },
+    "Handle No Files Available": {
+      "Type": "Pass",
+      "Assign": {
+        "status": "NO_FILES_AVAILABLE",
+        "message": "No files available for processing on the specified date",
+        "task_date": "{% $TASK_DATE %}"
+      },
+      "End": true
+    },
+    "Run Current & Forecast Batches in Parallel": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "Batch Processor - Current",
+          "States": {
+            "Batch Processor - Current": {
+              "Type": "Map",
+              "Label": "BatchProcessorCurrent",
+              "ItemBatcher": {
+                "MaxItemsPerBatch": "{% $CONCURRENCY %}"
+              },
+              "MaxConcurrency": 1,
+              "ItemReader": {
+                "Resource": "arn:aws:states:::s3:getObject",
+                "ReaderConfig": {
+                  "InputType": "JSON"
+                },
+                "Arguments": {
+                  "Bucket": "{% $INTEGRATION_BUCKET%}",
+                  "Key": "{% $BATCH_S3_KEY %}"
+                }
+              },
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "DISTRIBUTED",
+                  "ExecutionType": "STANDARD"
+                },
+                "StartAt": "Get Task Batch - Current",
+                "States": {
+                  "Get Task Batch - Current": {
+                    "Type": "Pass",
+                    "Next": "Get Start Time - Current",
+                    "Assign": {
+                      "TASK_BATCH": "{% $states.input.Items %}"
+                    },
+                    "Output": {}
+                  },
+                  "Get Start Time - Current": {
+                    "Type": "Pass",
+                    "Next": "Parallel Subtask Handler - Current",
+                    "Assign": {
+                      "startTime": "{% $floor($toMillis($now()) / 1000) %}"
+                    },
+                    "Output": {}
+                  },
+                  "Parallel Subtask Handler - Current": {
+                    "Type": "Map",
+                    "Label": "ParallelSubtaskHandlerCurrent",
+                    "ItemBatcher": {
+                      "MaxItemsPerBatch": 1
+                    },
+                    "MaxConcurrency": 1000,
+                    "Items": "{% $TASK_BATCH %}",
+                    "ItemProcessor": {
+                      "ProcessorConfig": {
+                        "Mode": "DISTRIBUTED",
+                        "ExecutionType": "STANDARD"
+                      },
+                      "StartAt": "Transform Data - Current",
+                      "States": {
+                        "Transform Data - Current": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::lambda:invoke",
+                          "Arguments": {
+                            "FunctionName": "${transform_data_task_lambda_function_arn}",
+                            "Payload": {
+                              "APP_ENV": "{% $states.input.Items[0].app_env %}",
+                              "AWS_REGION": "{% $states.input.Items[0].aws_region %}",
+                              "INTEGRATION_BUCKET": "{% $states.input.Items[0].integration_bucket %}",
+                              "ADDRESS_DESTINATION": "{% $states.input.Items[0].address_destination %}",
+                              "AIR_QUALITY_CURRENT_DESTINATION": "{% $states.input.Items[0].air_quality_current_destination %}",
+                              "AIR_QUALITY_FORECAST_DESTINATION": "{% $states.input.Items[0].air_quality_forecast_destination %}",
+                              "TASK_DATE": "{% $states.input.Items[0].task_date %}",
+                              "STEP_FUNCTION_RUNNER": "true",
+                              "B_NO": "{% $states.input.Items[0].b_no & '' %}",
+                              "T_NO": "{% $states.input.Items[0].t_no & '' %}",
+                              "START": "{% $states.input.Items[0].start & '' %}",
+                              "END": "{% $states.input.Items[0].end & '' %}",
+                              "AIR_QUALITY_TYPE": "current"
+                            }
+                          },
+                          "Output": {},
+                          "End": true
+                        }
+                      }
+                    },
+                    "Output": {},
+                    "Next": "Calculate Wait Time - Current"
+                  },
+                  "Calculate Wait Time - Current": {
+                    "Type": "Pass",
+                    "Assign": {
+                      "elapsedSeconds": "{% $floor($toMillis($now()) / 1000) - $startTime %}"
+                    },
+                    "Next": "Wait If Needed - Current",
+                    "Output": {}
+                  },
+                  "Wait If Needed - Current": {
+                    "Type": "Wait",
+                    "Seconds": "{% $elapsedSeconds < 70 ? 70 - $elapsedSeconds : 0 %}",
+                    "Next": "End - Current",
+                    "Output": {}
+                  },
+                  "End - Current": {
+                    "Type": "Pass",
+                    "Assign": {
+                      "TASK_BATCH": null
+                    },
+                    "End": true,
+                    "Output": {}
+                  }
+                }
+              },
+              "Output": {},
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Batch Processor - Forecast",
+          "States": {
+            "Batch Processor - Forecast": {
+              "Type": "Map",
+              "Label": "BatchProcessorForecast",
+              "ItemBatcher": {
+                "MaxItemsPerBatch": "{% $CONCURRENCY %}"
+              },
+              "MaxConcurrency": 1,
+              "ItemReader": {
+                "Resource": "arn:aws:states:::s3:getObject",
+                "ReaderConfig": {
+                  "InputType": "JSON"
+                },
+                "Arguments": {
+                  "Bucket": "{% $INTEGRATION_BUCKET%}",
+                  "Key": "{% $BATCH_S3_KEY %}"
+                }
+              },
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "DISTRIBUTED",
+                  "ExecutionType": "STANDARD"
+                },
+                "StartAt": "Get Task Batch - Forecast",
+                "States": {
+                  "Get Task Batch - Forecast": {
+                    "Type": "Pass",
+                    "Next": "Get Start Time - Forecast",
+                    "Assign": {
+                      "TASK_BATCH": "{% $states.input.Items %}"
+                    },
+                    "Output": {}
+                  },
+                  "Get Start Time - Forecast": {
+                    "Type": "Pass",
+                    "Next": "Parallel Subtask Handler - Forecast",
+                    "Assign": {
+                      "startTime": "{% $floor($toMillis($now()) / 1000) %}"
+                    },
+                    "Output": {}
+                  },
+                  "Parallel Subtask Handler - Forecast": {
+                    "Type": "Map",
+                    "Label": "ParallelSubtaskHandlerForecast",
+                    "ItemBatcher": {
+                      "MaxItemsPerBatch": 1
+                    },
+                    "MaxConcurrency": 1000,
+                    "Items": "{% $TASK_BATCH %}",
+                    "ItemProcessor": {
+                      "ProcessorConfig": {
+                        "Mode": "DISTRIBUTED",
+                        "ExecutionType": "STANDARD"
+                      },
+                      "StartAt": "Transform Data - Forecast",
+                      "States": {
+                        "Transform Data - Forecast": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::lambda:invoke",
+                          "Arguments": {
+                            "FunctionName": "${transform_data_task_lambda_function_arn}",
+                            "Payload": {
+                              "APP_ENV": "{% $states.input.Items[0].app_env %}",
+                              "AWS_REGION": "{% $states.input.Items[0].aws_region %}",
+                              "INTEGRATION_BUCKET": "{% $states.input.Items[0].integration_bucket %}",
+                              "ADDRESS_DESTINATION": "{% $states.input.Items[0].address_destination %}",
+                              "AIR_QUALITY_CURRENT_DESTINATION": "{% $states.input.Items[0].air_quality_current_destination %}",
+                              "AIR_QUALITY_FORECAST_DESTINATION": "{% $states.input.Items[0].air_quality_forecast_destination %}",
+                              "TASK_DATE": "{% $states.input.Items[0].task_date %}",
+                              "STEP_FUNCTION_RUNNER": "true",
+                              "B_NO": "{% $states.input.Items[0].b_no & '' %}",
+                              "T_NO": "{% $states.input.Items[0].t_no & '' %}",
+                              "START": "{% $states.input.Items[0].start & '' %}",
+                              "END": "{% $states.input.Items[0].end & '' %}",
+                              "AIR_QUALITY_TYPE": "forecast"
+                            }
+                          },
+                          "Output": {},
+                          "End": true
+                        }
+                      }
+                    },
+                    "Output": {},
+                    "Next": "Calculate Wait Time - Forecast"
+                  },
+                  "Calculate Wait Time - Forecast": {
+                    "Type": "Pass",
+                    "Assign": {
+                      "elapsedSeconds": "{% $floor($toMillis($now()) / 1000) - $startTime %}"
+                    },
+                    "Next": "Wait If Needed - Forecast",
+                    "Output": {}
+                  },
+                  "Wait If Needed - Forecast": {
+                    "Type": "Wait",
+                    "Seconds": "{% $elapsedSeconds < 70 ? 70 - $elapsedSeconds : 0 %}",
+                    "Next": "End - Forecast",
+                    "Output": {}
+                  },
+                  "End - Forecast": {
+                    "Type": "Pass",
+                    "Assign": {
+                      "TASK_BATCH": null
+                    },
+                    "End": true,
+                    "Output": {}
+                  }
+                }
+              },
+              "Output": {},
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "Load Data",
+      "Output": {}
+    },
+
+    "Load Data": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Arguments": {
+        "LaunchType": "FARGATE",
+        "Cluster": "${ecs_cluster_arn}",
+        "TaskDefinition": "${ecs_load_data_task_definition_arn}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${private_subnet_ids}"],
+            "SecurityGroups": ["${step_function_state_machine_sg_id}"],
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "task-runner",
+              "Environment": [
+                {
+                  "Name": "APP_ENV",
+                  "Value": "{% $APP_ENV %}"
+                },
+                {
+                  "Name": "AWS_REGION",
+                  "Value": "{% $AWS_REGION %}"
+                },
+                {
+                  "Name": "INTEGRATION_BUCKET",
+                  "Value": "{% $INTEGRATION_BUCKET %}"
+                },
+                {
+                  "Name": "AIR_QUALITY_CURRENT_DESTINATION",
+                  "Value": "{% $AIR_QUALITY_CURRENT_DESTINATION %}"
+                },
+                {
+                  "Name": "AIR_QUALITY_FORECAST_DESTINATION",
+                  "Value": "{% $AIR_QUALITY_FORECAST_DESTINATION %}"
+                },
+                {
+                  "Name": "TASK_DATE",
+                  "Value": "{% $TASK_DATE %}"
+                },
+                {
+                  "Name": "STEP_FUNCTION_RUNNER",
+                  "Value": "true"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 1,
+          "BackoffRate": 10,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "End": true,
+      "Output": {}
+    }
+  },
+  "QueryLanguage": "JSONata"
+}

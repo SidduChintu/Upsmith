@@ -1,0 +1,4 @@
+terraform init -backend-config="hcl/backend-local.hcl"
+
+
+terraform apply -var-file="env/local.tfvars" --auto-approve
