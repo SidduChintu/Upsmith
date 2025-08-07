@@ -1,0 +1,13 @@
+env = "local"
+aws_account_id = "587229285603"
+aws_region = "us-east-1"
+vpc_id = "vpc-0c089e1dc01c30a97"
+private_subnet_ids = ["subnet-02f219486caf6b998"]
+data_ingestion_security_group_id = "sg-0f484ae2ae6cd4650"
+step_function_scheduler_running_state = "DISABLED"
+step_function_schedule_expression = "cron(0 1 * * ? *)"
+init_task_lambda_function_image_version = "local-1.0.10"
+extract_data_task_ecs_task_image_version = "local-1.0.10"
+create_batch_job_task_lambda_function_image_version = "local-1.0.11"
+transform_data_task_lambda_function_image_version = "local-1.0.10"
+load_data_task_ecs_task_image_version = "local-1.0.6"
