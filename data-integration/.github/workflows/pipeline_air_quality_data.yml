@@ -1,0 +1,222 @@
+name: Air Quality Data Ingestion Pipeline
+
+on:
+  push:
+    branches: [dev, prod]
+    paths:
+      - air_quality_data/**
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select environment to deploy'
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPO_PREFIX: air-quality-data-ingestion
+  TF_BOOTSTRAP_DIR: air_quality_data/infra/bootstrap
+  TF_INFRA_DIR: air_quality_data/infra/infra
+  TF_DEV_VARS: env/dev.tfvars
+  TF_PROD_VARS: env/prod.tfvars
+  TF_DEV_BACKEND: hcl/backend-dev.hcl
+  TF_PROD_BACKEND: hcl/backend-prod.hcl
+
+  # Datadog
+  DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+  DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+  DATADOG_API_URL: https://api.datadoghq.com
+  DATADOG_SITE: datadoghq.com
+
+jobs:
+  set-version:
+    runs-on: ubuntu-latest
+    outputs:
+      image_version: ${{ steps.set-version.outputs.image_version }}
+    steps:
+      - name: Set IMAGE_VERSION
+        id: set-version
+        run: |
+          VERSION="1.0.${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          echo "Generated IMAGE_VERSION: $VERSION"
+          echo "image_version=$VERSION" >> $GITHUB_OUTPUT
+
+  terraform-bootstrap-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials for Bootstrap
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+          aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+          aws configure set default.region ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_BOOTSTRAP_DIR }}
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_BOOTSTRAP_DIR }}
+        run: terraform apply --auto-approve
+
+  build-push:
+    needs: [set-version, terraform-bootstrap-deploy]
+    strategy:
+      matrix:
+        task:
+          [
+            init_task,
+            extract_data_task,
+            create_task_batches,
+            transform_data_task,
+            load_data_task,
+          ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      IMAGE_VERSION: ${{ needs.set-version.outputs.image_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Map Task Folder to ECR Repo
+        id: map-repo
+        run: |
+          declare -A repo_map
+          repo_map[init_task]="init-task-lambda"
+          repo_map[extract_data_task]="extract-data-task"
+          repo_map[create_task_batches]="create-batch-job-lambda"
+          repo_map[transform_data_task]="transform-data-task-lambda"
+          repo_map[load_data_task]="load-data-task"
+
+          task="${{ matrix.task }}"
+          repo="${repo_map[$task]}"
+
+          if [[ -z "$repo" ]]; then
+            echo "No ECR mapping found for task: $task"
+            exit 1
+          fi
+
+          echo "Mapped $task → $repo"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS Credentials for ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+          aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+          aws configure set default.region ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region us-east-1 \
+          | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Build & Push Docker Image (x86_64)
+        run: |
+          IMAGE_URI=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO_PREFIX }}/${{ steps.map-repo.outputs.repo }}:${{ env.IMAGE_VERSION }}
+          echo "Building Docker image: $IMAGE_URI"
+          docker build --platform linux/amd64 -t $IMAGE_URI air_quality_data/${{ matrix.task }}
+          echo "Pushing Docker image: $IMAGE_URI"
+          docker push $IMAGE_URI
+
+  terraform-dev-deploy:
+    if: github.ref == 'refs/heads/dev' || github.event.inputs.environment == 'dev'
+    needs: [set-version, build-push]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials for Dev Infra
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+          aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+          aws configure set default.region ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        run: terraform init -backend-config="${{ env.TF_DEV_BACKEND }}"
+
+      - name: Terraform Apply with dev.tfvars
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        env:
+          IMAGE_VERSION: ${{ needs.set-version.outputs.image_version }}
+        run: |
+          terraform apply -var-file="${{ env.TF_DEV_VARS }}" \
+            -var="init_task_lambda_function_image_version=$IMAGE_VERSION" \
+            -var="extract_data_task_ecs_task_image_version=$IMAGE_VERSION" \
+            -var="create_batch_job_task_lambda_function_image_version=$IMAGE_VERSION" \
+            -var="transform_data_task_lambda_function_image_version=$IMAGE_VERSION" \
+            -var="load_data_task_ecs_task_image_version=$IMAGE_VERSION" \
+            -var="datadog_api_key=$DATADOG_API_KEY" \
+            -var="datadog_app_key=$DATADOG_APP_KEY" \
+            -var="datadog_api_url=$DATADOG_API_URL" \
+            -var="datadog_site=$DATADOG_SITE" \
+            --auto-approve
+
+  terraform-prod-deploy:
+    if: github.ref == 'refs/heads/prod' || github.event.inputs.environment == 'prod'
+    needs: [set-version, build-push]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials for Prod Infra
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+          aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+          aws configure set default.region ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        run: terraform init -backend-config="${{ env.TF_PROD_BACKEND }}"
+
+      - name: Terraform Apply with prod.tfvars
+        working-directory: ${{ env.TF_INFRA_DIR }}
+        env:
+          IMAGE_VERSION: ${{ needs.set-version.outputs.image_version }}
+        run: |
+          terraform apply -var-file="${{ env.TF_PROD_VARS }}" \
+            -var="init_task_lambda_function_image_version=$IMAGE_VERSION" \
+            -var="extract_data_task_ecs_task_image_version=$IMAGE_VERSION" \
+            -var="create_batch_job_task_lambda_function_image_version=$IMAGE_VERSION" \
+            -var="transform_data_task_lambda_function_image_version=$IMAGE_VERSION" \
+            -var="load_data_task_ecs_task_image_version=$IMAGE_VERSION" \
+            -var="datadog_api_key=$DATADOG_API_KEY" \
+            -var="datadog_app_key=$DATADOG_APP_KEY" \
+            -var="datadog_api_url=$DATADOG_API_URL" \
+            -var="datadog_site=$DATADOG_SITE" \
+            --auto-approve
